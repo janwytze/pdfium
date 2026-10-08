@@ -1,0 +1,161 @@
+# Renders the 1751_1 corpus test with the Windows GDI renderer, before and
+# after https://pdfium-review.googlesource.com/c/pdfium/+/160010, to check the
+# new 1751_1_expected_gdi.pdf.0.png. The "base" render must match the current
+# GDI expectation exactly, or this runner's GDI+ output can't be trusted.
+name: GDI render 1751_1
+
+on:
+  push:
+    branches: [gdi-render-1751]
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    runs-on: windows-2022
+    timeout-minutes: 240
+    env:
+      DEPOT_TOOLS_WIN_TOOLCHAIN: "0"
+      BASE_REV: 8d804d1424af0598d1aba3d085354689f709cb08
+      CL_REF: refs/changes/10/160010/5
+      CL_REV: cf785bed094b3c53ffee493a8abea312de87bdf3
+      WINSDK_VERSION: 10.0.28000.0
+      WINSDK_URL: https://go.microsoft.com/fwlink/?linkid=2370315
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Configure git
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # testing/tools/test_runner.py imports build/util/lib/results, which needs
+      # requests (pdfium's vpython.toml pins 2.31.0).
+      - name: Install Python deps
+        run: python -m pip install --disable-pip-version-check requests==2.31.0
+
+      - name: Install depot_tools
+        run: |
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$GITHUB_WORKSPACE/depot_tools"
+          echo "$GITHUB_WORKSPACE/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Install Windows SDK
+        run: |
+          SDK_BIN="/c/Program Files (x86)/Windows Kits/10/bin/$WINSDK_VERSION"
+          if [ ! -d "$SDK_BIN/x64" ] || [ ! -f "/c/Program Files (x86)/Windows Kits/10/Debuggers/x64/dbghelp.dll" ]; then
+            curl -sSL -o "$RUNNER_TEMP/winsdksetup.exe" "$WINSDK_URL"
+            MSYS2_ARG_CONV_EXCL="*" "$RUNNER_TEMP/winsdksetup.exe" \
+              /features OptionId.DesktopCPPx64 OptionId.WindowsDesktopDebuggers \
+              /ceip off /quiet /norestart
+          fi
+          K="/c/Program Files (x86)/Windows Kits/10"
+          for f in "$K/Include/$WINSDK_VERSION/um/windows.h" \
+                   "$K/Include/$WINSDK_VERSION/ucrt/stdio.h" \
+                   "$K/Lib/$WINSDK_VERSION/um/x64/kernel32.lib" \
+                   "$K/Lib/$WINSDK_VERSION/ucrt/x64/ucrt.lib" \
+                   "$K/Debuggers/x64/dbghelp.dll"; do
+            test -f "$f" || { echo "missing $f"; exit 1; }
+          done
+
+      - name: Checkout PDFium
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/w"
+          cd "$GITHUB_WORKSPACE/w"
+          cat > .gclient <<'EOF'
+          solutions = [
+            {
+              "name": "pdfium",
+              "url": "https://pdfium.googlesource.com/pdfium.git",
+              "managed": False,
+              "custom_deps": {},
+              "custom_vars": {
+                "checkout_configuration": "minimal",
+                "checkout_testing_corpus": True,
+              },
+            },
+          ]
+          target_os = ["win"]
+          EOF
+          gclient sync -r "pdfium@$BASE_REV" --no-history --shallow
+          git -C pdfium log --oneline -1
+          git -C pdfium/testing/corpus log --oneline -1
+          # Fail now rather than after the build if the test runner can't start.
+          python pdfium/testing/tools/run_corpus_tests.py --help > /dev/null
+
+      - name: Build base
+        working-directory: w/pdfium
+        run: |
+          mkdir -p out/Release
+          cat > out/Release/args.gn <<'EOF'
+          is_debug = false
+          pdf_is_standalone = true
+          pdf_enable_v8 = false
+          pdf_enable_xfa = false
+          is_component_build = false
+          symbol_level = 0
+          treat_warnings_as_errors = false
+          use_remoteexec = false
+          EOF
+          gn gen out/Release
+          ninja -C out/Release pdfium_test pdfium_diff
+          out/Release/pdfium_test.exe --show-config
+
+      - name: Render base
+        working-directory: w/pdfium
+        run: |
+          A="$GITHUB_WORKSPACE/artifacts"
+          mkdir -p "$A"
+          cp testing/corpus/fx/path/1751_1_expected*.png "$A/"
+          G=out/Release/gen/pdfium/testing/corpus
+          for r in gdi agg; do
+            rm -f "$G/1751_1.pdf.0.png" "$G/1751_1.pdf.0.diff.png"
+            set +e
+            python testing/tools/run_corpus_tests.py --build-dir out/Release \
+              --use-renderer=$r fx/path/1751_1.pdf > "$A/base_$r.log" 2>&1
+            echo "exit=$?" >> "$A/base_$r.log"
+            set -e
+            cat "$A/base_$r.log"
+            cp "$G/1751_1.pdf.0.png" "$A/base_$r.png" || echo "::warning::no PNG for base $r"
+            cp "$G/1751_1.pdf.0.diff.png" "$A/base_${r}_diff.png" 2>/dev/null || true
+          done
+
+      - name: Checkout CL
+        working-directory: w/pdfium
+        run: |
+          git fetch --depth=1 https://pdfium.googlesource.com/pdfium "$CL_REF"
+          test "$(git rev-parse FETCH_HEAD)" = "$CL_REV"
+          git checkout --detach FETCH_HEAD
+          git log --oneline -1
+
+      - name: Build CL
+        working-directory: w/pdfium
+        run: ninja -C out/Release pdfium_test pdfium_diff
+
+      - name: Render CL
+        working-directory: w/pdfium
+        run: |
+          A="$GITHUB_WORKSPACE/artifacts"
+          G=out/Release/gen/pdfium/testing/corpus
+          for r in gdi agg; do
+            rm -f "$G/1751_1.pdf.0.png" "$G/1751_1.pdf.0.diff.png"
+            set +e
+            python testing/tools/run_corpus_tests.py --build-dir out/Release \
+              --use-renderer=$r fx/path/1751_1.pdf > "$A/cl_$r.log" 2>&1
+            echo "exit=$?" >> "$A/cl_$r.log"
+            set -e
+            cat "$A/cl_$r.log"
+            cp "$G/1751_1.pdf.0.png" "$A/cl_$r.png" || echo "::warning::no PNG for cl $r"
+            cp "$G/1751_1.pdf.0.diff.png" "$A/cl_${r}_diff.png" 2>/dev/null || true
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gdi-render-1751
+          path: artifacts/
