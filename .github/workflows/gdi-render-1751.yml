@@ -2,6 +2,8 @@
 # after https://pdfium-review.googlesource.com/c/pdfium/+/160010, to check the
 # new 1751_1_expected_gdi.pdf.0.png. The "base" render must match the current
 # GDI expectation exactly, or this runner's GDI+ output can't be trusted.
+# The skia flavor matches the win_xfa_skia_gdi bot, which also uses the _gdi
+# expectation when there is no _skia_gdi one.
 name: GDI render 1751_1
 
 on:
@@ -15,7 +17,17 @@ jobs:
   render:
     runs-on: windows-2022
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: agg
+            renderers: gdi agg
+          - flavor: skia
+            renderers: gdi skia
     env:
+      FLAVOR: ${{ matrix.flavor }}
+      RENDERERS: ${{ matrix.renderers }}
       DEPOT_TOOLS_WIN_TOOLCHAIN: "0"
       BASE_REV: 8d804d1424af0598d1aba3d085354689f709cb08
       CL_REF: refs/changes/10/160010/5
@@ -77,6 +89,7 @@ jobs:
               "custom_vars": {
                 "checkout_configuration": "minimal",
                 "checkout_testing_corpus": True,
+                "checkout_skia": True,
               },
             },
           ]
@@ -102,6 +115,9 @@ jobs:
           treat_warnings_as_errors = false
           use_remoteexec = false
           EOF
+          if [ "$FLAVOR" = skia ]; then
+            echo "pdf_use_skia = true" >> out/Release/args.gn
+          fi
           gn gen out/Release
           ninja -C out/Release pdfium_test pdfium_diff
           out/Release/pdfium_test.exe --show-config
@@ -113,7 +129,7 @@ jobs:
           mkdir -p "$A"
           cp testing/corpus/fx/path/1751_1_expected*.png "$A/"
           G=out/Release/gen/pdfium/testing/corpus
-          for r in gdi agg; do
+          for r in $RENDERERS; do
             rm -f "$G/1751_1.pdf.0.png" "$G/1751_1.pdf.0.diff.png"
             set +e
             python testing/tools/run_corpus_tests.py --build-dir out/Release \
@@ -142,7 +158,7 @@ jobs:
         run: |
           A="$GITHUB_WORKSPACE/artifacts"
           G=out/Release/gen/pdfium/testing/corpus
-          for r in gdi agg; do
+          for r in $RENDERERS; do
             rm -f "$G/1751_1.pdf.0.png" "$G/1751_1.pdf.0.diff.png"
             set +e
             python testing/tools/run_corpus_tests.py --build-dir out/Release \
@@ -157,5 +173,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: gdi-render-1751
+          name: gdi-render-1751-${{ matrix.flavor }}
           path: artifacts/
